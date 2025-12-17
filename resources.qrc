@@ -1,0 +1,7 @@
+﻿<RCC>
+    <qresource prefix="/res">
+        <file>WIN.jpg</file>
+        <file>LOSE.jpg</file>
+        <file>LuoZi.wav</file>
+    </qresource>
+</RCC>

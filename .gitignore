@@ -1,0 +1,28 @@
+# Qt / C++
+build*/
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+
+# Qt Creator
+*.pro.user
+*.user
+*.autosave
+*.qmlc
+*.qrc.depends
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CMake (如果未来用)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Logs
+*.log
