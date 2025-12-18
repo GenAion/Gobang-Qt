@@ -1,4 +1,4 @@
-﻿#ifndef NETWORKMANAGER_H
+#ifndef NETWORKMANAGER_H
 #define NETWORKMANAGER_H
 
 #include <QObject>
@@ -62,7 +62,7 @@ private:
 
     QTimer pingTimer_;
 
-    QString serverHost_ = "替换为服务器公网ip";
+    QString serverHost_ = "8.137.118.254";
     quint16 serverPort_ = 5000;
 };
 

@@ -1,4 +1,4 @@
-﻿#ifndef GAMEWINDOW_H
+#ifndef GAMEWINDOW_H
 #define GAMEWINDOW_H
 
 #include <QWidget>
@@ -11,6 +11,11 @@
 #include <QSoundEffect>
 #include <QUrl>
 
+class QLabel;
+class QPushButton;
+class QComboBox;
+class QLineEdit;
+
 class NetworkManager;
 
 class GameWindow : public QWidget
@@ -19,14 +24,9 @@ class GameWindow : public QWidget
 public:
     explicit GameWindow(QWidget *parent = nullptr);
 
-protected:
-    void paintEvent(QPaintEvent *event) override;
-    void mouseReleaseEvent(QMouseEvent *event) override;
-    void mouseMoveEvent(QMouseEvent *event) override;
-    void leaveEvent(QEvent *event) override;
-    void resizeEvent(QResizeEvent *event) override;
-
 private slots:
+    void onConnectClicked();
+
     void onMoveReceived(int x, int y, int color, int seq, int nextColor,
                         bool gameOver, int winner, const QVector<QPoint> &winFive);
 
@@ -43,8 +43,37 @@ private slots:
     void onAnimTick();
 
 private:
-    void initUiAndNetwork();
+    class BoardWidget : public QWidget
+    {
+    public:
+        explicit BoardWidget(GameWindow *game);
 
+    protected:
+        void paintEvent(QPaintEvent *event) override;
+        void mouseReleaseEvent(QMouseEvent *event) override;
+        void mouseMoveEvent(QMouseEvent *event) override;
+        void leaveEvent(QEvent *event) override;
+        void resizeEvent(QResizeEvent *event) override;
+
+    private:
+        GameWindow *game_ = nullptr;
+    };
+
+    friend class BoardWidget;
+
+    // UI
+    void setupUi();
+    void setUiEnabled(bool enabled);
+    void updateStatusText(const QString &text);
+
+    // Network start
+    void startNetwork();
+
+    // Board repaint helpers
+    void updateBoardAll();
+    void updateBoardRect(const QRect &rc);
+
+    // Game state
     enum class GameState {
         WaitingConnection,
         WaitingOpponent,
@@ -58,6 +87,11 @@ private:
     bool isMyTurn()   const { return state_ == GameState::MyTurn; }
     bool isGameOver() const { return state_ == GameState::GameOver; }
 
+    // Board layout/cache
+    int  boardW() const;
+    int  boardH() const;
+    QRect boardRect() const;
+
     void updateLayoutMetrics();
     void rebuildBoardCache();
 
@@ -66,6 +100,21 @@ private:
 
     QPoint coordFromMouse(const QPoint &pos) const;
 
+    QRect cellDirtyRect(int x, int y, int extraPx = 18) const;
+    QRect hoverDirtyRect(const QPoint &cell) const;
+    QRect countdownDirtyRect() const;
+    QRect winFiveDirtyRect() const;
+
+    // Painting (called by BoardWidget)
+    void paintBoard(QPainter &p);
+
+    // Board input (called by BoardWidget)
+    void handleBoardMouseRelease(QMouseEvent *event);
+    void handleBoardMouseMove(QMouseEvent *event);
+    void handleBoardLeave();
+    void handleBoardResize();
+
+    // Core game logic
     bool placeStone(int x, int y, int color);
 
     bool checkWinAt(int x, int y, int color) const;
@@ -93,12 +142,21 @@ private:
     void clearHover();
     void setHoverCell(const QPoint &cell, HoverMode mode);
 
-    QRect cellDirtyRect(int x, int y, int extraPx = 18) const;
-    QRect hoverDirtyRect(const QPoint &cell) const;
-    QRect countdownDirtyRect() const;
-    QRect winFiveDirtyRect() const;
+    // 将常见英文日志翻译为中文（未知内容原样返回，避免误译）
+    QString translateLogToChinese(const QString &msg) const;
 
 private:
+    // UI Widgets
+    QWidget     *leftPanel_   = nullptr;
+    BoardWidget *boardView_   = nullptr;
+
+    QComboBox   *roleCombo_   = nullptr;
+    QLineEdit   *roomEdit_    = nullptr;
+    QPushButton *connectBtn_  = nullptr;
+    QLabel      *statusLabel_ = nullptr;
+
+private:
+    // Game data
     static constexpr int BOARD_SIZE = 15;
 
     int cellSize_ = 40;

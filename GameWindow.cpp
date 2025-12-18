@@ -1,9 +1,8 @@
-﻿#include "GameWindow.h"
+#include "GameWindow.h"
 #include "NetworkManager.h"
 
 #include <QPainter>
 #include <QMouseEvent>
-#include <QInputDialog>
 #include <QMessageBox>
 #include <QDebug>
 #include <QPainterPath>
@@ -11,22 +10,76 @@
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QFormLayout>
 #include <QPushButton>
+#include <QComboBox>
+#include <QLineEdit>
 #include <QtMath>
 #include <algorithm>
 
-static constexpr int LAST_MARK_BLINK_MS = 1600;  // 新落子后闪烁时长
-static constexpr int LAST_MARK_TOGGLE_MS = 240; // 闪烁频率
+static constexpr int LAST_MARK_BLINK_MS = 1600;
+static constexpr int LAST_MARK_TOGGLE_MS = 240;
 
+// =============================
+// BoardWidget impl
+// =============================
+GameWindow::BoardWidget::BoardWidget(GameWindow *game)
+    : QWidget(game), game_(game)
+{
+    setMouseTracking(true);
+    setFocusPolicy(Qt::StrongFocus);
+}
+
+void GameWindow::BoardWidget::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event);
+    if (!game_) return;
+
+    if (!qFuzzyCompare(game_->boardCacheDpr_, devicePixelRatioF()) || game_->boardCache_.isNull()) {
+        game_->rebuildBoardCache();
+    }
+
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    game_->paintBoard(p);
+}
+
+void GameWindow::BoardWidget::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (!game_) return;
+    game_->handleBoardMouseRelease(event);
+}
+
+void GameWindow::BoardWidget::mouseMoveEvent(QMouseEvent *event)
+{
+    if (!game_) return;
+    game_->handleBoardMouseMove(event);
+}
+
+void GameWindow::BoardWidget::leaveEvent(QEvent *event)
+{
+    Q_UNUSED(event);
+    if (!game_) return;
+    game_->handleBoardLeave();
+}
+
+void GameWindow::BoardWidget::resizeEvent(QResizeEvent *event)
+{
+    QWidget::resizeEvent(event);
+    if (!game_) return;
+    game_->handleBoardResize();
+}
+
+// =============================
+// GameWindow impl
+// =============================
 GameWindow::GameWindow(QWidget *parent)
     : QWidget(parent),
     board_(BOARD_SIZE, QVector<int>(BOARD_SIZE, 0)),
     anims_(BOARD_SIZE, QVector<CellAnim>(BOARD_SIZE))
 {
-    resize(900, 700);
-
-    setWindowTitle("Gomoku");
-    setMouseTracking(true);
+    resize(980, 720);
+    setWindowTitle("五子棋");
 
     winImg_.load(":/res/WIN.jpg");
     loseImg_.load(":/res/LOSE.jpg");
@@ -48,23 +101,176 @@ GameWindow::GameWindow(QWidget *parent)
 
     clock_.start();
 
-    updateLayoutMetrics();
-    rebuildBoardCache();
-    initUiAndNetwork();
+    setupUi();
+    handleBoardResize();
+    updateStatusText("尚未连接。请选择角色、输入房间号，然后点击“连接”。");
 }
 
-void GameWindow::resizeEvent(QResizeEvent *event)
+void GameWindow::setupUi()
 {
-    QWidget::resizeEvent(event);
+    auto *root = new QHBoxLayout(this);
+    root->setContentsMargins(10, 10, 10, 10);
+    root->setSpacing(10);
+
+    // Left panel
+    leftPanel_ = new QWidget(this);
+    leftPanel_->setFixedWidth(260);
+
+    auto *leftLayout = new QVBoxLayout(leftPanel_);
+    leftLayout->setContentsMargins(12, 12, 12, 12);
+    leftLayout->setSpacing(10);
+
+    QLabel *title = new QLabel("连接", leftPanel_);
+    QFont tf = title->font();
+    tf.setPointSize(tf.pointSize() + 3);
+    tf.setBold(true);
+    title->setFont(tf);
+    leftLayout->addWidget(title);
+
+    roleCombo_ = new QComboBox(leftPanel_);
+    roleCombo_->addItem("房主（黑棋）");
+    roleCombo_->addItem("访客（白棋）");
+
+    roomEdit_ = new QLineEdit(leftPanel_);
+    roomEdit_->setPlaceholderText("例如：room1");
+    roomEdit_->setText("room1");
+
+    auto *form = new QFormLayout();
+    form->setLabelAlignment(Qt::AlignLeft);
+    form->setFormAlignment(Qt::AlignTop);
+    form->addRow("角色：", roleCombo_);
+    form->addRow("房间号：", roomEdit_);
+    leftLayout->addLayout(form);
+
+    connectBtn_ = new QPushButton("连接", leftPanel_);
+    connect(connectBtn_, &QPushButton::clicked, this, &GameWindow::onConnectClicked);
+    leftLayout->addWidget(connectBtn_);
+
+    statusLabel_ = new QLabel(leftPanel_);
+    statusLabel_->setWordWrap(true);
+    statusLabel_->setMinimumHeight(120);
+    statusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    leftLayout->addWidget(statusLabel_, 1);
+
+    QLabel *tips = new QLabel(leftPanel_);
+    tips->setWordWrap(true);
+    tips->setText("提示：\n"
+                  "1）房主先创建/进入房间。\n"
+                  "2）访客输入相同房间号进入。\n"
+                  "3）若重新开局，双方会从服务器状态同步。");
+    QFont sf = tips->font();
+    sf.setPointSize(std::max(8, sf.pointSize() - 1));
+    tips->setFont(sf);
+    leftLayout->addWidget(tips);
+
+    // Right board view
+    boardView_ = new BoardWidget(this);
+
+    root->addWidget(leftPanel_);
+    root->addWidget(boardView_, 1);
+
+    setLayout(root);
+}
+
+void GameWindow::setUiEnabled(bool enabled)
+{
+    if (roleCombo_) roleCombo_->setEnabled(enabled);
+    if (roomEdit_) roomEdit_->setEnabled(enabled);
+    if (connectBtn_) connectBtn_->setEnabled(enabled);
+}
+
+void GameWindow::updateStatusText(const QString &text)
+{
+    if (statusLabel_) statusLabel_->setText(text);
+}
+
+void GameWindow::onConnectClicked()
+{
+    if (!roomEdit_) return;
+
+    const QString roomId = roomEdit_->text().trimmed();
+    if (roomId.isEmpty()) {
+        QMessageBox::information(this, "输入", "房间号不能为空。");
+        return;
+    }
+
+    startNetwork();
+}
+
+void GameWindow::startNetwork()
+{
+    if (net_) {
+        net_->deleteLater();
+        net_ = nullptr;
+    }
+
+    const bool wantHost = (roleCombo_ && roleCombo_->currentIndex() == 0);
+    const QString roomId = roomEdit_ ? roomEdit_->text().trimmed() : QString();
+
+    amHost_  = wantHost;
+    myColor_ = amHost_ ? 1 : 2;
+
+    opponentPresent_ = false;
+    serverNextColor_ = 1;
+
+    serverGameOver_ = false;
+    serverWinner_ = 0;
+
+    lastSeqApplied_ = 0;
+    state_ = GameState::WaitingConnection;
+
+    resetBoardToNewGame();
+    updateBoardAll();
+
+    net_ = new NetworkManager(this);
+
+    connect(net_, &NetworkManager::moveReceived, this, &GameWindow::onMoveReceived);
+    connect(net_, &NetworkManager::stateReceived, this, &GameWindow::onStateReceived);
+    connect(net_, &NetworkManager::presenceChanged, this, &GameWindow::onPresenceChanged);
+    connect(net_, &NetworkManager::moveRejected, this, &GameWindow::onMoveRejected);
+
+    connect(net_, &NetworkManager::p2pConnected, this, &GameWindow::onP2PConnected);
+    connect(net_, &NetworkManager::logMessage, this, &GameWindow::onLogMessage);
+
+    setUiEnabled(false);
+
+    updateStatusText(QString("正在连接…\n角色：%1\n房间号：%2")
+                         .arg(amHost_ ? "房主（黑棋）" : "访客（白棋）")
+                         .arg(roomId));
+
+    net_->start(amHost_ ? NetworkManager::Host : NetworkManager::Guest, roomId);
+
+    if (amHost_) setWindowTitle("五子棋 - 房主（黑棋）");
+    else         setWindowTitle("五子棋 - 访客（白棋）");
+}
+
+int GameWindow::boardW() const { return boardView_ ? boardView_->width() : width(); }
+int GameWindow::boardH() const { return boardView_ ? boardView_->height() : height(); }
+QRect GameWindow::boardRect() const { return boardView_ ? boardView_->rect() : rect(); }
+
+void GameWindow::updateBoardAll()
+{
+    if (boardView_) boardView_->update();
+    else update();
+}
+
+void GameWindow::updateBoardRect(const QRect &rc)
+{
+    if (boardView_) boardView_->update(rc);
+    else update(rc);
+}
+
+void GameWindow::handleBoardResize()
+{
     updateLayoutMetrics();
     rebuildBoardCache();
-    update();
+    updateBoardAll();
 }
 
 void GameWindow::updateLayoutMetrics()
 {
-    const int w = width();
-    const int h = height();
+    const int w = boardW();
+    const int h = boardH();
 
     topExtra_ = qMax(55, int(h * 0.08));
     const int baseMargin = qMax(18, int(qMin(w, h) * 0.03));
@@ -91,13 +297,11 @@ void GameWindow::updateLayoutMetrics()
 
 void GameWindow::rebuildBoardCache()
 {
-    const QSize s = size();
+    const QSize s(boardW(), boardH());
     if (s.isEmpty()) return;
 
-    const qreal dpr = devicePixelRatioF();
-    if (!boardCache_.isNull() && boardCache_.size() == s * dpr && qFuzzyCompare(boardCacheDpr_, dpr)) {
-        return;
-    }
+    const qreal dpr = boardView_ ? boardView_->devicePixelRatioF() : devicePixelRatioF();
+    if (!boardCache_.isNull() && boardCache_.size() == s * dpr && qFuzzyCompare(boardCacheDpr_, dpr)) return;
 
     boardCacheDpr_ = dpr;
 
@@ -161,7 +365,7 @@ QRect GameWindow::cellDirtyRect(int x, int y, int extraPx) const
 
     const int r  = int(cellSize_ / 2.0) + extraPx;
     QRect rc(cx - r, cy - r, 2 * r, 2 * r);
-    return rc.intersected(rect());
+    return rc.intersected(boardRect());
 }
 
 QRect GameWindow::hoverDirtyRect(const QPoint &cell) const
@@ -172,8 +376,8 @@ QRect GameWindow::hoverDirtyRect(const QPoint &cell) const
 
 QRect GameWindow::countdownDirtyRect() const
 {
-    QRect rc(8, 6, 360, qMax(60, int(topExtra_ * 0.9)));
-    return rc.intersected(rect());
+    QRect rc(8, 6, 420, qMax(60, int(topExtra_ * 0.9)));
+    return rc.intersected(boardRect());
 }
 
 QRect GameWindow::winFiveDirtyRect() const
@@ -191,7 +395,7 @@ QRect GameWindow::winFiveDirtyRect() const
     QRect a = cellDirtyRect(minx, miny, qMax(24, int(cellSize_ * 0.85)));
     QRect b = cellDirtyRect(maxx, maxy, qMax(24, int(cellSize_ * 0.85)));
     QRect rc = a.united(b).adjusted(-20, -20, 20, 20);
-    return rc.intersected(rect());
+    return rc.intersected(boardRect());
 }
 
 void GameWindow::clearHover()
@@ -203,7 +407,7 @@ void GameWindow::clearHover()
     hoverMode_ = HoverNone;
 
     const QRect dirty = hoverDirtyRect(oldCell);
-    if (dirty.isValid()) update(dirty);
+    if (dirty.isValid()) updateBoardRect(dirty);
 }
 
 void GameWindow::setHoverCell(const QPoint &cell, HoverMode mode)
@@ -215,55 +419,8 @@ void GameWindow::setHoverCell(const QPoint &cell, HoverMode mode)
     hoverMode_ = mode;
 
     QRect dirty = hoverDirtyRect(oldCell).united(hoverDirtyRect(cell));
-    dirty = dirty.intersected(rect());
-    if (dirty.isValid()) update(dirty);
-}
-
-void GameWindow::initUiAndNetwork()
-{
-    QStringList roles;
-    roles << "Host" << "Guest";
-
-    bool ok = false;
-    QString roleStr = QInputDialog::getItem(this, "Choose Role", "Role:", roles, 0, false, &ok);
-    if (!ok) { close(); return; }
-
-    QString roomId = QInputDialog::getText(this, "Room ID",
-                                           "Enter room ID (e.g. room1):",
-                                           QLineEdit::Normal,
-                                           "room1",
-                                           &ok);
-    if (!ok || roomId.isEmpty()) { close(); return; }
-
-    NetworkManager::Role role =
-        (roleStr == "Host") ? NetworkManager::Host : NetworkManager::Guest;
-
-    net_ = new NetworkManager(this);
-
-    connect(net_, &NetworkManager::moveReceived, this, &GameWindow::onMoveReceived);
-    connect(net_, &NetworkManager::stateReceived, this, &GameWindow::onStateReceived);
-    connect(net_, &NetworkManager::presenceChanged, this, &GameWindow::onPresenceChanged);
-    connect(net_, &NetworkManager::moveRejected, this, &GameWindow::onMoveRejected);
-
-    connect(net_, &NetworkManager::p2pConnected, this, &GameWindow::onP2PConnected);
-    connect(net_, &NetworkManager::logMessage, this, &GameWindow::onLogMessage);
-
-    net_->start(role, roomId);
-
-    amHost_  = (role == NetworkManager::Host);
-    myColor_ = amHost_ ? 1 : 2;
-
-    opponentPresent_ = false;
-    serverNextColor_ = 1;
-
-    serverGameOver_ = false;
-    serverWinner_ = 0;
-
-    lastSeqApplied_ = 0;
-    state_ = GameState::WaitingConnection;
-
-    if (amHost_) setWindowTitle(windowTitle() + " - Host(Black)");
-    else         setWindowTitle(windowTitle() + " - Guest(White)");
+    dirty = dirty.intersected(boardRect());
+    if (dirty.isValid()) updateBoardRect(dirty);
 }
 
 void GameWindow::startMyTurn()
@@ -272,7 +429,7 @@ void GameWindow::startMyTurn()
         state_ = GameState::GameOver;
         turnTimer_.stop();
         clearHover();
-        update(countdownDirtyRect());
+        updateBoardRect(countdownDirtyRect());
         return;
     }
 
@@ -280,21 +437,21 @@ void GameWindow::startMyTurn()
         state_ = GameState::WaitingOpponent;
         turnTimer_.stop();
         clearHover();
-        update(countdownDirtyRect());
+        updateBoardRect(countdownDirtyRect());
         return;
     }
 
     state_ = GameState::MyTurn;
     timeLeft_ = TURN_TIME_SECONDS;
     turnTimer_.start();
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
 }
 
 void GameWindow::endMyTurn()
 {
     turnTimer_.stop();
     clearHover();
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
 }
 
 void GameWindow::onPresenceChanged(int onlineCount)
@@ -303,7 +460,7 @@ void GameWindow::onPresenceChanged(int onlineCount)
     if (opponentPresent_ == nowPresent) return;
 
     opponentPresent_ = nowPresent;
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
 
     if (!isConnected() || isGameOver()) return;
 
@@ -311,7 +468,7 @@ void GameWindow::onPresenceChanged(int onlineCount)
         state_ = GameState::WaitingOpponent;
         turnTimer_.stop();
         clearHover();
-        update(countdownDirtyRect());
+        updateBoardRect(countdownDirtyRect());
         return;
     }
 
@@ -319,7 +476,7 @@ void GameWindow::onPresenceChanged(int onlineCount)
         if (serverNextColor_ == myColor_) startMyTurn();
         else {
             state_ = GameState::OpponentTurn;
-            update(countdownDirtyRect());
+            updateBoardRect(countdownDirtyRect());
         }
     }
 }
@@ -331,7 +488,7 @@ void GameWindow::onTurnTimerTick()
     if (serverGameOver_) return;
 
     timeLeft_--;
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
 
     if (timeLeft_ <= 0) autoMoveBest();
 }
@@ -362,7 +519,6 @@ void GameWindow::onAnimTick()
         }
     }
 
-    // 最后一手红圈/红点闪烁期间刷新
     if (lastMove_.x() >= 0 && lastMove_.y() >= 0) {
         if (lastMarkBlinking_) {
             if (now - lastMarkStartMs_ >= LAST_MARK_BLINK_MS) {
@@ -388,8 +544,8 @@ void GameWindow::onAnimTick()
         return;
     }
 
-    dirty = dirty.intersected(rect());
-    if (dirty.isValid()) update(dirty);
+    dirty = dirty.intersected(boardRect());
+    if (dirty.isValid()) updateBoardRect(dirty);
 }
 
 void GameWindow::autoMoveBest()
@@ -400,28 +556,19 @@ void GameWindow::autoMoveBest()
 
     QPoint best = findBestMove(myColor_);
     if (best.x() < 0) {
-        endGameAndAskRestart("Game Over", "Draw!");
+        endGameAndAskRestart("对局结束", "平局！");
         return;
     }
 
     endMyTurn();
     state_ = GameState::OpponentTurn;
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
 
     if (net_) net_->sendMove(best.x(), best.y(), myColor_);
 }
 
-void GameWindow::paintEvent(QPaintEvent *event)
+void GameWindow::paintBoard(QPainter &p)
 {
-    Q_UNUSED(event);
-
-    if (!qFuzzyCompare(boardCacheDpr_, devicePixelRatioF()) || boardCache_.isNull()) {
-        rebuildBoardCache();
-    }
-
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, true);
-
     p.drawPixmap(0, 0, boardCache_);
 
     const int ox = boardOriginX();
@@ -566,7 +713,6 @@ void GameWindow::paintEvent(QPaintEvent *event)
             p.save();
             p.setRenderHint(QPainter::Antialiasing, true);
 
-            // 外圈
             QPen ringPen(QColor(220, 30, 30));
             ringPen.setWidth(qMax(2, int(cellSize_ * 0.10)));
             ringPen.setCapStyle(Qt::RoundCap);
@@ -576,13 +722,11 @@ void GameWindow::paintEvent(QPaintEvent *event)
             const qreal ringR = stoneRadius * 0.92;
             p.drawEllipse(c, ringR, ringR);
 
-            // 内点
             p.setPen(Qt::NoPen);
             p.setBrush(QColor(220, 30, 30));
             const qreal dotR = qMax(2.0, cellSize_ * 0.10);
             p.drawEllipse(c, dotR, dotR);
 
-            // 轻微光晕（更醒目）
             QPen haloPen(QColor(255, 140, 140));
             haloPen.setWidth(qMax(1, int(cellSize_ * 0.05)));
             p.setPen(haloPen);
@@ -593,7 +737,8 @@ void GameWindow::paintEvent(QPaintEvent *event)
         }
     }
 
-    // ===== 五连闪光 =====
+    // ===== 五连闪光（略：与之前一致）=====
+    // （此处保持原逻辑不变，只是显示文案在 finalizeGame/endGameAndAskRestart 里已中文化）
     if (!winFive_.isEmpty()) {
         int litCount = 5;
         qreal glowAlpha = 0.55;
@@ -675,7 +820,7 @@ void GameWindow::paintEvent(QPaintEvent *event)
         }
     }
 
-    // ===== 倒计时 UI =====
+    // ===== 倒计时 UI（中文文案）=====
     if (isConnected() && !isGameOver()) {
         const int ringSize = qMax(38, int(cellSize_ * 1.05));
         QRectF ringRect(12, 10, ringSize, ringSize);
@@ -705,18 +850,18 @@ void GameWindow::paintEvent(QPaintEvent *event)
         p.setPen((state_ == GameState::MyTurn && timeLeft_ <= 5) ? QColor(200, 30, 30) : QColor(20, 20, 20));
 
         if (state_ == GameState::MyTurn) p.drawText(ringRect, Qt::AlignCenter, QString::number(qMax(0, timeLeft_)));
-        else                             p.drawText(ringRect, Qt::AlignCenter, "-");
+        else                             p.drawText(ringRect, Qt::AlignCenter, "—");
 
         QFont sf = p.font();
         sf.setPointSize(qMax(10, int(cellSize_ * 0.30)));
         sf.setBold(true);
         p.setFont(sf);
 
-        QString side = (myColor_ == 1) ? "Black" : "White";
+        QString side = (myColor_ == 1) ? "黑棋" : "白棋";
         QString status;
-        if (!opponentPresent_) status = "Waiting for opponent...";
-        else if (state_ == GameState::MyTurn) status = QString("%1 turn").arg(side);
-        else status = "Waiting for opponent move...";
+        if (!opponentPresent_) status = "等待对手…";
+        else if (state_ == GameState::MyTurn) status = QString("%1回合").arg(side);
+        else status = "等待对手落子…";
 
         p.setPen(QColor(30, 30, 30));
         p.drawText(12 + ringSize + 10, 10 + ringSize - 14, status);
@@ -731,8 +876,7 @@ QPoint GameWindow::coordFromMouse(const QPoint &pos) const
     int x = (pos.x() - ox + cellSize_ / 2) / cellSize_;
     int y = (pos.y() - oy + cellSize_ / 2) / cellSize_;
 
-    if (x < 0 || x >= BOARD_SIZE || y < 0 || y >= BOARD_SIZE)
-        return QPoint(-1, -1);
+    if (x < 0 || x >= BOARD_SIZE || y < 0 || y >= BOARD_SIZE) return QPoint(-1, -1);
     return QPoint(x, y);
 }
 
@@ -754,12 +898,11 @@ bool GameWindow::placeStone(int x, int y, int color)
     anims_[y][x].startMs = clock_.elapsed();
     anims_[y][x].durationMs = STONE_ANIM_MS;
 
-    // 新落子：最后手标记闪烁
     lastMarkBlinking_ = true;
     lastMarkStartMs_  = clock_.elapsed();
 
     if (!animTimer_.isActive()) animTimer_.start();
-    update();
+    updateBoardAll();
     return true;
 }
 
@@ -782,8 +925,7 @@ bool GameWindow::checkWinAt(int x, int y, int color) const
     static const int dirs[4][2] = { {1,0},{0,1},{1,1},{1,-1} };
     for (auto &d : dirs) {
         int dx = d[0], dy = d[1];
-        int total = 1
-                    + countInDirection(x, y,  dx,  dy, color)
+        int total = 1 + countInDirection(x, y, dx, dy, color)
                     + countInDirection(x, y, -dx, -dy, color);
         if (total >= 5) return true;
     }
@@ -798,19 +940,20 @@ bool GameWindow::isBoardFull() const
     return true;
 }
 
-void GameWindow::mouseReleaseEvent(QMouseEvent *event)
+// ===== Board input handlers =====
+void GameWindow::handleBoardMouseRelease(QMouseEvent *event)
 {
     if (!isConnected()) {
-        QMessageBox::information(this, "Info", "Not connected yet. Please wait.");
+        QMessageBox::information(this, "提示", "尚未连接，请先点击“连接”。");
         return;
     }
     if (serverGameOver_) {
-        QMessageBox::information(this, "Info", "Game is over. Please restart.");
+        QMessageBox::information(this, "提示", "对局已结束，请重新开局。");
         return;
     }
     if (isGameOver()) return;
     if (!isMyTurn()) {
-        QMessageBox::information(this, "Info", "Not your turn.");
+        QMessageBox::information(this, "提示", "还没轮到你。");
         return;
     }
     if (!opponentPresent_) return;
@@ -822,12 +965,12 @@ void GameWindow::mouseReleaseEvent(QMouseEvent *event)
     clearHover();
     endMyTurn();
     state_ = GameState::OpponentTurn;
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
 
     if (net_) net_->sendMove(c.x(), c.y(), myColor_);
 }
 
-void GameWindow::mouseMoveEvent(QMouseEvent *event)
+void GameWindow::handleBoardMouseMove(QMouseEvent *event)
 {
     if (!isConnected() || isGameOver() || !isMyTurn() || !opponentPresent_ || serverGameOver_) {
         clearHover();
@@ -841,24 +984,32 @@ void GameWindow::mouseMoveEvent(QMouseEvent *event)
     else                           setHoverCell(c, HoverBlocked);
 }
 
-void GameWindow::leaveEvent(QEvent *event)
+void GameWindow::handleBoardLeave()
 {
-    Q_UNUSED(event);
     clearHover();
 }
 
+// ===== Network callbacks =====
 void GameWindow::onMoveRejected(const QString &reason)
 {
-    QMessageBox::information(this, "Move Rejected", "Reason: " + reason);
+    QString cnReason;
+    if (reason == "occupied") cnReason = "该位置已有棋子。";
+    else if (reason == "not_your_turn") cnReason = "未轮到你。";
+    else if (reason == "game_over") cnReason = "对局已结束。";
+    else if (reason == "not_ready") cnReason = "对手未就绪/未进入。";
+    else cnReason = reason; // 未知原因，原样显示
+
+    QMessageBox::information(this, "落子被拒绝", "原因：" + cnReason);
+
     if (reason == "game_over") {
         serverGameOver_ = true;
         state_ = GameState::GameOver;
         endMyTurn();
         clearHover();
-        update();
+        updateBoardAll();
     } else {
         if (serverNextColor_ == myColor_) startMyTurn();
-        else { state_ = GameState::OpponentTurn; update(countdownDirtyRect()); }
+        else { state_ = GameState::OpponentTurn; updateBoardRect(countdownDirtyRect()); }
     }
 }
 
@@ -888,17 +1039,16 @@ void GameWindow::onStateReceived(const QVector<int> &flatBoard, int nextColor, i
         for (auto &a : row) { a.active = false; a.startMs = 0; a.durationMs = STONE_ANIM_MS; }
 
     lastMove_ = QPoint(lastX, lastY);
-    // 重连时不闪烁，但必须显示红圈红点
     lastMarkBlinking_ = false;
     lastMarkStartMs_  = clock_.elapsed();
 
     if (serverGameOver_) {
-        QString text = (serverWinner_ == 1) ? "Black wins!" : (serverWinner_ == 2) ? "White wins!" : "Game Over";
+        QString text = (serverWinner_ == 1) ? "黑棋胜！" : (serverWinner_ == 2) ? "白棋胜！" : "对局结束";
         if (winFive.size() == 5) {
-            startWinFiveAnim(winFive, "Game Over", text, serverWinner_);
+            startWinFiveAnim(winFive, "对局结束", text, serverWinner_);
         } else {
             state_ = GameState::GameOver;
-            update();
+            updateBoardAll();
         }
         return;
     }
@@ -914,7 +1064,7 @@ void GameWindow::onStateReceived(const QVector<int> &flatBoard, int nextColor, i
     if (nextColor == myColor_) startMyTurn();
     else state_ = opponentPresent_ ? GameState::OpponentTurn : GameState::WaitingOpponent;
 
-    update();
+    updateBoardAll();
 }
 
 void GameWindow::onMoveReceived(int x, int y, int color, int seq, int nextColor,
@@ -930,35 +1080,55 @@ void GameWindow::onMoveReceived(int x, int y, int color, int seq, int nextColor,
     serverWinner_ = winner;
 
     if (serverGameOver_) {
-        QString text = (serverWinner_ == 1) ? "Black wins!" : "White wins!";
-        if (winFive.size() == 5) startWinFiveAnim(winFive, "Game Over", text, serverWinner_);
-        else endGameAndAskRestart("Game Over", text);
+        QString text = (serverWinner_ == 1) ? "黑棋胜！" : "白棋胜！";
+        if (winFive.size() == 5) startWinFiveAnim(winFive, "对局结束", text, serverWinner_);
+        else endGameAndAskRestart("对局结束", text);
         return;
     }
 
     if (isBoardFull()) {
-        endGameAndAskRestart("Game Over", "Draw!");
+        endGameAndAskRestart("对局结束", "平局！");
         return;
     }
 
     if (nextColor == myColor_) startMyTurn();
     else state_ = opponentPresent_ ? GameState::OpponentTurn : GameState::WaitingOpponent;
 
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
 }
 
 void GameWindow::onP2PConnected()
 {
-    QMessageBox::information(this, "Connected", "Room joined. Waiting opponent / state sync.");
+    updateStatusText("已连接到信令服务器。\n已加入房间。\n等待对手 / 状态同步中…");
     state_ = GameState::WaitingOpponent;
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
+}
+
+QString GameWindow::translateLogToChinese(const QString &msg) const
+{
+    QString s = msg;
+
+    // 常见短语精准替换（只替换我们“能确定含义”的内容）
+    s.replace("Connected to signaling server.", "已连接到信令服务器。");
+    s.replace("Joined room.", "已加入房间。");
+    s.replace("Waiting opponent / state sync...", "等待对手 / 状态同步中…");
+    s.replace("Connecting...", "正在连接…");
+    s.replace("Waiting for opponent...", "等待对手…");
+    s.replace("Waiting for opponent move...", "等待对手落子…");
+
+    s.replace("Host", "房主");
+    s.replace("Guest", "访客");
+
+    return s;
 }
 
 void GameWindow::onLogMessage(const QString &msg)
 {
     qDebug("%s", qPrintable(msg));
+    updateStatusText(translateLogToChinese(msg));
 }
 
+// ===== Reset / result dialog logic =====
 void GameWindow::resetBoardToNewGame()
 {
     endMyTurn();
@@ -988,7 +1158,7 @@ void GameWindow::resetBoardToNewGame()
     serverGameOver_ = false;
     serverWinner_ = 0;
 
-    update();
+    updateBoardAll();
 }
 
 bool GameWindow::showResultDialog(bool iWin, const QString &title, const QString &text)
@@ -1023,8 +1193,8 @@ bool GameWindow::showResultDialog(bool iWin, const QString &title, const QString
     QHBoxLayout *btnRow = new QHBoxLayout();
     btnRow->addStretch(1);
 
-    QPushButton *btnRestart = new QPushButton(QStringLiteral("再来一局"), &dlg);
-    QPushButton *btnQuit    = new QPushButton(QStringLiteral("退出"), &dlg);
+    QPushButton *btnRestart = new QPushButton("再来一局", &dlg);
+    QPushButton *btnQuit    = new QPushButton("退出", &dlg);
     btnRestart->setDefault(true);
 
     btnRow->addWidget(btnRestart);
@@ -1046,7 +1216,7 @@ void GameWindow::doServerRestart()
 {
     resetBoardToNewGame();
     state_ = opponentPresent_ ? GameState::OpponentTurn : GameState::WaitingOpponent;
-    update(countdownDirtyRect());
+    updateBoardRect(countdownDirtyRect());
     if (net_) net_->sendReset();
 }
 
@@ -1055,8 +1225,9 @@ void GameWindow::finalizeGame(const QString &title, const QString &text)
     if (!isGameOver()) return;
 
     bool iWin = false;
-    if (text.contains("Black") && myColor_ == 1) iWin = true;
-    if (text.contains("White") && myColor_ == 2) iWin = true;
+    // 这里以“赢家颜色”判断更可靠，但为了不破坏你原逻辑，保持兼容：
+    if (text.contains("黑棋") && myColor_ == 1) iWin = true;
+    if (text.contains("白棋") && myColor_ == 2) iWin = true;
 
     const bool restart = showResultDialog(iWin, title, text);
     if (restart) { doServerRestart(); return; }
@@ -1073,14 +1244,14 @@ void GameWindow::endGameAndAskRestart(const QString &title, const QString &text)
 
 void GameWindow::startWinFiveAnim(const QVector<QPoint> &five, const QString &title, const QString &text, int winnerColor)
 {
+    Q_UNUSED(winnerColor);
+
     endMyTurn();
     state_ = GameState::GameOver;
 
     clearHover();
 
     winFive_ = five;
-    winAnimWinnerColor_ = winnerColor;
-
     winAnimActive_ = true;
     winAnimStartMs_ = clock_.elapsed();
 
@@ -1092,7 +1263,7 @@ void GameWindow::startWinFiveAnim(const QVector<QPoint> &five, const QString &ti
     const int totalMs = WIN_STEP_MS * 5 + WIN_TAIL_MS;
     winAnimDelayTimer_.start(totalMs);
 
-    update(winFiveDirtyRect());
+    updateBoardRect(winFiveDirtyRect());
 }
 
 // ===== AI（保持原样）=====
